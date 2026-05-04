@@ -1,6 +1,7 @@
 import EventEmitter from 'node:events';
 import process from 'node:process';
 import test from 'ava';
+import FakeTimers from '@sinonjs/fake-timers';
 import chalk from 'chalk';
 import stripAnsi from 'strip-ansi';
 import React, {Component, useEffect, useState} from 'react';
@@ -26,6 +27,18 @@ import {
 } from './helpers/render-to-string.js';
 import {run} from './helpers/run.js';
 import {renderAsync} from './helpers/test-renderer.js';
+
+const createRawModeStdin = (): NodeJS.WriteStream => {
+	const stdin = new EventEmitter() as NodeJS.WriteStream;
+	stdin.setEncoding = () => {};
+	stdin.setRawMode = spy();
+	stdin.isTTY = true;
+	stdin.ref = spy();
+	stdin.unref = spy();
+	stdin.read = stub();
+
+	return stdin;
+};
 
 test('text', t => {
 	const output = renderToString(<Text>Hello World</Text>);
@@ -597,15 +610,10 @@ test('replace child node with text', t => {
 });
 
 // See https://github.com/vadimdemedes/ink/issues/145
-test('disable raw mode when all input components are unmounted', t => {
+test('disable raw mode when all input components are unmounted', async t => {
 	const stdout = createStdout();
 
-	const stdin = new EventEmitter() as NodeJS.WriteStream;
-	stdin.setEncoding = () => {};
-	stdin.setRawMode = spy();
-	stdin.isTTY = true; // Without this, setRawMode will throw
-	stdin.ref = spy();
-	stdin.unref = spy();
+	const stdin = createRawModeStdin();
 
 	const options = {
 		stdout,
@@ -651,14 +659,23 @@ test('disable raw mode when all input components are unmounted', t => {
 	t.true(stdin.setRawMode.calledOnce);
 	t.true(stdin.ref.calledOnce);
 	t.deepEqual(stdin.setRawMode.firstCall.args, [true]);
+	t.is(stdin.listenerCount('readable'), 1);
 
 	rerender(<Test renderFirstInput />);
 
 	t.true(stdin.setRawMode.calledOnce);
 	t.true(stdin.ref.calledOnce);
 	t.true(stdin.unref.notCalled);
+	t.is(stdin.listenerCount('readable'), 1);
 
 	rerender(<Test />);
+	t.true(stdin.setRawMode.calledOnce);
+	t.true(stdin.unref.notCalled);
+	t.is(stdin.listenerCount('readable'), 0);
+
+	await new Promise(resolve => {
+		queueMicrotask(resolve);
+	});
 
 	t.true(stdin.setRawMode.calledTwice);
 	t.true(stdin.ref.calledOnce);
@@ -666,14 +683,112 @@ test('disable raw mode when all input components are unmounted', t => {
 	t.deepEqual(stdin.setRawMode.lastCall.args, [false]);
 });
 
+test('do not disable raw mode when swapping components that use useInput', async t => {
+	const stdout = createStdout();
+
+	const stdin = createRawModeStdin();
+
+	const options = {
+		stdout,
+		stdin,
+		debug: true,
+	};
+
+	function StepA() {
+		useInput(() => {});
+		return <Text>A</Text>;
+	}
+
+	function StepB() {
+		useInput(() => {});
+		return <Text>B</Text>;
+	}
+
+	function Test({step}: {readonly step: number}) {
+		return step === 1 ? <StepA /> : <StepB />;
+	}
+
+	const {rerender} = render(
+		<Test step={1} />,
+		// eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+		options as any,
+	);
+
+	t.true(stdin.setRawMode.calledOnce);
+	t.true(stdin.ref.calledOnce);
+	t.deepEqual(stdin.setRawMode.firstCall.args, [true]);
+	t.is(stdin.listenerCount('readable'), 1);
+
+	rerender(<Test step={2} />);
+	t.is(stdin.listenerCount('readable'), 1);
+
+	await new Promise(resolve => {
+		queueMicrotask(resolve);
+	});
+
+	t.true(stdin.unref.notCalled);
+	t.deepEqual(stdin.setRawMode.lastCall.args, [true]);
+	t.is(stdin.listenerCount('readable'), 1);
+});
+
+test('clear pending input parser state when swapping components that use useInput', async t => {
+	const clock = FakeTimers.install({
+		toFake: ['setTimeout', 'clearTimeout'],
+	});
+
+	try {
+		const stdout = createStdout();
+
+		const stdin = createRawModeStdin();
+
+		const options = {
+			stdout,
+			stdin,
+			debug: true,
+		};
+
+		const receivedInputs: string[] = [];
+
+		function StepA() {
+			useInput(() => {});
+			return <Text>A</Text>;
+		}
+
+		function StepB() {
+			useInput(input => {
+				receivedInputs.push(input);
+			});
+
+			return <Text>B</Text>;
+		}
+
+		function Test({step}: {readonly step: number}) {
+			return step === 1 ? <StepA /> : <StepB />;
+		}
+
+		const {rerender} = render(
+			<Test step={1} />,
+			// eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+			options as any,
+		);
+
+		emitReadable(stdin, '\u001B[');
+		rerender(<Test step={2} />);
+
+		await new Promise(resolve => {
+			queueMicrotask(resolve);
+		});
+
+		await clock.tickAsync(20);
+
+		t.deepEqual(receivedInputs, []);
+	} finally {
+		clock.uninstall();
+	}
+});
+
 test('re-ref stdin when input is used after previous unmount', t => {
-	const stdin = new EventEmitter() as NodeJS.WriteStream;
-	stdin.setEncoding = () => {};
-	stdin.read = stub();
-	stdin.setRawMode = spy();
-	stdin.isTTY = true; // Without this, setRawMode will throw
-	stdin.ref = spy();
-	stdin.unref = spy();
+	const stdin = createRawModeStdin();
 
 	const options = {
 		stdout: createStdout(),
